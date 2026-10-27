@@ -1,4 +1,4 @@
-// Click Before Frames v2.77 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+// Click Before Frames v2.78 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -1239,6 +1239,7 @@ namespace {
         int tick = 0;
         int delay = 0;
         bool skipped = false;  // v2.64: a save was held back here because of memory
+        int expected = 0;      // v2.78: ticks after the decision at which the ghost still died (0 = unknown / safe)
     } pending;
 
     int sliceOf(PlayerObject* p) {
@@ -1356,7 +1357,7 @@ namespace {
     }
 
     // Called for every decision: remembers it until it can be scored.
-    void memoryNote(PlayerObject* p1, int delay) {
+    void memoryNote(PlayerObject* p1, int delay, int expected = 0) {
         if (!buf.learn || memoryKey.empty()) {
             return;
         }
@@ -1364,7 +1365,7 @@ namespace {
         if (pending.active && tickCount - pending.tick >= st(30)) {
             creditPending();
         }
-        pending = { true, sliceOf(p1), tickCount, delay, false };
+        pending = { true, sliceOf(p1), tickCount, delay, false, expected };
     }
 
     void memoryTick() {
@@ -1382,7 +1383,15 @@ namespace {
         pending.active = false;
         auto& spot = memory[pending.slice];
         ++spot.deaths;
-        if (pending.delay > 0) {
+        // v2.78: the orb search often saves the orb but knows the ghost still dies a bit later
+        // (e.g. "-> 71t": the next obstacle). Dying at or after that moment is that obstacle,
+        // not a failed save; counting it made the memory give up on saves at those orbs
+        // ("saves here failed before, input left alone") and the orb was then missed.
+        bool predicted = pending.expected > 0 && tickCount - pending.tick >= pending.expected - st(8);
+        if (pending.delay > 0 && predicted && buf.explain) {
+            say("memory: died when the look-ahead said it would ({}t), not counted against the save", pending.expected);
+        }
+        if (pending.delay > 0 && !predicted) {
             ++spot.bad;
         }
         // v2.64: memory held a save back and you died anyway, so leaving the input alone
@@ -1832,8 +1841,8 @@ namespace {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - clickStart).count();
     }
 
-    void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter) {
-        memoryNote(p1, delay);
+    void decided(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter, int expected = 0) {
+        memoryNote(p1, delay, expected);
         if (clickMs() > buf.budgetMs * 1.5) {
             finishDrift("");  // no time left for the debug runs this click
             return;
@@ -1881,16 +1890,36 @@ namespace {
             bool nowUses = buf.orbUsedTick >= 0;
             if (nowUses && now < horizon && buf.orbTiming) {
                 // v2.26: ...but crashes. Where in the orb you click changes where it sends
-                // you, so try clicking 1 to 6 ticks later, still inside the orb; the run
+                // you, so try clicking later, still inside the orb; the run
                 // that lives longest (and clearly longer than now) wins.
+                // v2.78: this used to stop at +6 ticks, but in the logs the delay that saved the
+                // orb was often +7, +8 or +14 (the general search found it, the orb search
+                // never looked that far). It now goes as far as the orb window setting.
                 int bestRet = -1;
-                for (int k = 1; k <= std::min(window, st(6)); ++k) {
+                int sameCrash = 0;
+                for (int k = 1; k <= std::min(window, st(16)); ++k) {
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
                         trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
                     }
                     if (end == SimEnd::StopSearch) {
                         break;
+                    }
+                    // v2.78: a crash that is far away and comes at the very same tick for three
+                    // delays in a row doesn't depend on this click (it's the next obstacle), so
+                    // the remaining delays aren't tried. That is what ran the time budget out
+                    // before: each of these runs is long, and they all end the same way.
+                    int diff = k + ret - now;
+                    if (diff < 0) {
+                        diff = -diff;
+                    }
+                    if (now >= st(30) && diff <= 1) {
+                        if (++sameCrash >= 3) {
+                            break;
+                        }
+                    }
+                    else {
+                        sameCrash = 0;
                     }
                     if (buf.orbUsedTick < 0 || ret < std::min(horizon, now + st(12)) || ret <= bestRet) {
                         continue;
@@ -1910,7 +1939,7 @@ namespace {
                 //    longest wins (earliest on a tie), instead of simply the first that hits
                 //    the orb: where in the orb you click changes where the orb sends you.
                 int bestRet = -1;
-                for (int k = std::max(1, touch - 1); k <= std::min(window, touch + st(6)); ++k) {
+                for (int k = std::max(1, touch - 1); k <= std::min(window, touch + st(16)); ++k) {
                     int ret = simulate(layer, p1, p2, dual, k, true, horizon, releaseAfter, horizon, &end);
                     if (buf.explain) {
                         trace += fmt::format(" +{}:{}{}", k, ret, buf.orbUsedTick >= 0 ? "o" : "-");
@@ -2991,7 +3020,8 @@ namespace {
             if (k > 0) {
                 say("ORB {} +{}t ({:g}f) -> {}t", buf.orbWasTiming ? "timing" : "press", k, k * TICK, orbLanded);
                 noteSave(layer, k);
-                decided(layer, p1, p2, dual, k, down, horizon, releaseAfter);
+                // v2.78: when the ghost still died after this save, remember when (k + ticks lived)
+                decided(layer, p1, p2, dual, k, down, horizon, releaseAfter, orbLanded < horizon ? k + orbLanded : 0);
                 buf.shift = k;
                 queueInput(k - early, down);
                 return true;
